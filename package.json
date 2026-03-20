@@ -1,0 +1,28 @@
+{
+  "name": "whatsapp-mcp",
+  "version": "1.0.0",
+  "description": "WhatsApp MCP server using Baileys",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc && node dist/index.js",
+    "login": "tsc && node dist/login.js"
+  },
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@modelcontextprotocol/sdk": "latest",
+    "@whiskeysockets/baileys": "latest",
+    "link-preview-js": "^3.0.0",
+    "pino": "^9.0.0",
+    "pino-pretty": "^11.0.0",
+    "qrcode-terminal": "^0.12.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/qrcode-terminal": "^0.12.2",
+    "typescript": "^5.7.0"
+  }
+}

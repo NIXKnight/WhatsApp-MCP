@@ -117,6 +117,89 @@ export function registerMessageTools(server: McpServer): void {
   );
 
   // -----------------------------------------------------------------------
+  // check_new_messages
+  // -----------------------------------------------------------------------
+
+  // Server-side memory: tracks last checked timestamp per jid+participant combo
+  const lastChecked = new Map<string, number>();
+
+  server.tool(
+    "check_new_messages",
+    "Lightweight poll for new messages in a chat. Automatically tracks the last " +
+      "checked timestamp server-side — no need to pass it. Returns only unseen " +
+      "messages, optionally filtered by participant. Returns compact summary or " +
+      "'No new messages.' if nothing new.",
+    {
+      jid: z.string().min(1).describe("Chat JID to check"),
+      participantFilter: z
+        .string()
+        .optional()
+        .describe("Optional participant LID or JID to filter by, e.g. 259570677067973@lid"),
+    },
+    async ({ jid, participantFilter }) => {
+      try {
+        const key = `${jid}:${participantFilter ?? "all"}`;
+        const since = lastChecked.get(key) ?? Math.floor(Date.now() / 1000);
+
+        const allMessages = getMessages(jid, 100);
+        const filtered = allMessages.filter((m) => {
+          const ts = typeof m.messageTimestamp === "object"
+            ? (m.messageTimestamp as { low: number }).low
+            : Number(m.messageTimestamp);
+          if (ts <= since) return false;
+          if (m.key.fromMe) return false;
+          if (!m.message) return false;
+          if (m.message.protocolMessage || m.message.reactionMessage) return false;
+          if (participantFilter && m.key.participant !== participantFilter) return false;
+          return true;
+        });
+
+        // Update the watermark to the latest message timestamp or now
+        const maxTs = filtered.reduce((max, m) => {
+          const ts = typeof m.messageTimestamp === "object"
+            ? (m.messageTimestamp as { low: number }).low
+            : Number(m.messageTimestamp);
+          return ts > max ? ts : max;
+        }, since);
+        lastChecked.set(key, maxTs);
+
+        if (filtered.length === 0) {
+          return {
+            content: [{ type: "text" as const, text: "No new messages." }],
+          };
+        }
+
+        const summary = filtered.map((m) => {
+          const msg = m.message;
+          let text = "";
+          if (msg?.conversation) text = msg.conversation;
+          else if (msg?.extendedTextMessage?.text) text = msg.extendedTextMessage.text;
+          return {
+            id: m.key.id,
+            participant: m.key.participant,
+            pushName: m.pushName ?? "",
+            text,
+            timestamp: Number(m.messageTimestamp),
+          };
+        });
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ count: summary.length, messages: summary }),
+          }],
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text" as const, text: `Error: ${message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -----------------------------------------------------------------------
   // get_messages
   // -----------------------------------------------------------------------
   server.tool(

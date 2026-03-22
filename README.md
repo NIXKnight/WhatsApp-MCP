@@ -4,7 +4,7 @@ A production-ready Model Context Protocol (MCP) server that connects Claude (or 
 
 ## Features
 
-The WhatsApp MCP Server exposes 9 tools to enable full WhatsApp automation:
+The WhatsApp MCP Server exposes 12 tools to enable full WhatsApp automation:
 
 1. **send_message** — Send plain-text messages to individual contacts with optional mentions and quote/reply support
 2. **get_messages** — Retrieve the most recent messages from a chat
@@ -15,6 +15,9 @@ The WhatsApp MCP Server exposes 9 tools to enable full WhatsApp automation:
 7. **send_group_message** — Send messages to groups with optional mentions and quote/reply support
 8. **send_media** — Send media files (images, videos, audio, documents) to contacts or groups
 9. **download_media** — Download media attachments from received messages
+10. **check_new_messages** — Lightweight polling to check for new messages since a given timestamp
+11. **get_unread_chats** — Returns all chats with unread messages, including JID, name, unread count, and latest unread messages
+12. **get_unread_messages** — Get unread messages from a specific chat
 
 ## Tech Stack
 
@@ -40,7 +43,7 @@ WhatsApp-MCP/
 │       ├── groups.ts            # list_groups, get_group, send_group_message tools
 │       └── media.ts             # send_media, download_media tools
 ├── dist/                        # Compiled JavaScript (after build)
-├── auth_info/                   # Persisted authentication credentials (gitignored)
+├── ~/.whatsapp-mcp/             # Persisted authentication credentials and store data (gitignored)
 ├── package.json
 ├── tsconfig.json
 └── .gitignore
@@ -78,17 +81,17 @@ npm run login
 The tool will:
 1. Generate a QR code in your terminal
 2. Prompt you to scan it with your phone via WhatsApp > Settings > Linked Devices > Link a Device
-3. Save credentials to `auth_info/` (gitignored)
+3. Save credentials to `~/.whatsapp-mcp/auth_info/` (gitignored)
 4. Exit when authentication is complete
 
-Credentials persist in the `auth_info/` directory and are reused on subsequent server starts. You only need to run this once.
+Credentials persist in the `~/.whatsapp-mcp/auth_info/` directory and are reused on subsequent server starts. You only need to run this once.
 
 ### Re-Authentication
 
 If you see "Logged out" messages or need to re-authenticate:
 
 ```bash
-rm -rf auth_info/
+rm -rf ~/.whatsapp-mcp/auth_info/
 npm run login
 ```
 
@@ -181,6 +184,21 @@ Download the media from message 3AEBEEF123ABC456 in chat 923001234567@s.whatsapp
 Fetch metadata for group 120363039783372408@g.us including participant list
 ```
 
+**Send a voice note:**
+```
+Send a voice note from /home/user/recording.ogg to 923001234567 with ptt enabled
+```
+
+**Check unread chats:**
+```
+Show me all my unread chats with message counts
+```
+
+**Get unread messages from a chat:**
+```
+Get unread messages from chat 923001234567@s.whatsapp.net
+```
+
 ## Tool Reference
 
 | Tool | Parameters | Returns |
@@ -192,8 +210,11 @@ Fetch metadata for group 120363039783372408@g.us including participant list
 | `list_groups` | (none) | Array of group objects |
 | `get_group` | `jid` (group JID) | Full group metadata with participants |
 | `send_group_message` | `jid` (group), `text`, `mentions?`, `quotedMessageId?`, `quotedParticipant?` | Confirmation or error |
-| `send_media` | `to` (phone/JID), `filePath`, `caption?`, `mediaType?` (auto-detected) | Confirmation or error |
+| `send_media` | `to` (phone/JID), `filePath`, `caption?`, `mediaType?` (auto-detected), `ptt?` (push-to-talk for voice notes) | Confirmation or error |
 | `download_media` | `messageId`, `jid`, `outputDir?` (default ./downloads) | File path on disk or error |
+| `check_new_messages` | `since?` (timestamp in ms, default 0) | Array of new message objects |
+| `get_unread_chats` | (none) | Array of unread chat objects with JID, name, unread count, and latest unread messages |
+| `get_unread_messages` | `jid` (chat ID) | Array of unread message objects from the chat |
 
 ## Key Implementation Details
 
@@ -204,8 +225,9 @@ Baileys v7 removed `makeInMemoryStore()`. This server implements a minimal custo
 - Tracks chats, contacts, and message history in-memory
 - Binds to Baileys socket events for automatic synchronization
 - Provides helper functions in `store.ts` for querying data
+- Serializes store data to `~/.whatsapp-mcp/store_data.json` for persistence across restarts
 
-**Note:** The store is volatile and resets on restart. Historical messages sync gradually after reconnection from WhatsApp servers.
+**Note:** The store is persisted to `~/.whatsapp-mcp/store_data.json` and survives restarts. Historical messages sync gradually after reconnection from WhatsApp servers.
 
 ### QR Code Rendering
 
@@ -219,7 +241,7 @@ Baileys v7 deprecated `printQRInTerminal()`. This server:
 
 - Uses `fetchLatestBaileysVersion()` to retrieve the latest WhatsApp Web protocol version
 - Implements `makeCacheableSignalKeyStore()` for reliable key management
-- Multi-file authentication state stored in `auth_info/`
+- Multi-file authentication state stored in `~/.whatsapp-mcp/auth_info/`
 
 ### Mentions and Quoting
 
@@ -263,6 +285,7 @@ The logger uses pino with minimal configuration and writes to stderr by default.
 - Media type is auto-detected from file extension (`.jpg`, `.mp4`, `.mp3`, `.pdf`, etc.)
 - Manual override via `mediaType` parameter when needed
 - Captions are supported for images, videos, and documents
+- Voice notes: Set `ptt: true` to send audio as a WhatsApp voice note (push-to-talk). Requires OGG Opus format
 
 **Downloading Media:**
 

@@ -8,6 +8,7 @@ import makeWASocket, {
   Contact,
   WAMessage,
   BaileysEventEmitter,
+  Browsers,
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
@@ -18,12 +19,20 @@ import * as fs from 'fs';
 export const DATA_DIR = path.join(process.env.HOME ?? process.env.USERPROFILE ?? '.', '.whatsapp-mcp');
 const AUTH_DIR = path.join(DATA_DIR, 'auth_info');
 const STORE_FILE = path.join(DATA_DIR, 'store_data.json');
+const LOG_FILE = path.join(DATA_DIR, 'sync.log');
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 
 // Logger MUST write to stderr (fd 2) — stdout is reserved for MCP JSON-RPC
 const logger = pino({ level: 'warn' }, pino.destination(2));
+
+function log(message: string): void {
+  const timestamp = new Date().toISOString();
+  const line = `[${timestamp}] ${message}\n`;
+  process.stderr.write(line);
+  fs.appendFileSync(LOG_FILE, line);
+}
 
 // ---------------------------------------------------------------------------
 // Minimal in-memory store (replaces the removed makeInMemoryStore from v7)
@@ -78,16 +87,17 @@ function makeSimpleStore(): SimpleStore {
       for (const ct of cts) {
         contacts.set(ct.id, ct);
       }
-      // msgs are WAMessage[]
       for (const msg of msgs) {
         const jid = msg.key.remoteJid;
         if (!jid) continue;
         upsertMessages(jid, [msg]);
       }
+      log(`[sync] History sync received: ${cs.length} chats, ${cts.length} contacts, ${msgs.length} messages`);
     });
 
     ev.on('chats.upsert', (cs) => {
       for (const c of cs) upsertChat(c);
+      log(`[sync] Chats upsert: ${cs.length} chats`);
     });
 
     ev.on('chats.update', (updates) => {
@@ -97,8 +107,11 @@ function makeSimpleStore(): SimpleStore {
         const existing = chats.get(id);
         if (existing) {
           chats.set(id, { ...existing, ...update } as Chat);
+        } else {
+          chats.set(id, update as Chat);
         }
       }
+      log(`[sync] Chats update: ${updates.length} chats (store now: ${chats.size})`);
     });
 
     ev.on('chats.delete', (ids) => {
@@ -107,6 +120,7 @@ function makeSimpleStore(): SimpleStore {
 
     ev.on('contacts.upsert', (cts) => {
       for (const ct of cts) contacts.set(ct.id, ct);
+      log(`[sync] Contacts upsert: ${cts.length} contacts`);
     });
 
     ev.on('contacts.update', (updates) => {
@@ -119,6 +133,7 @@ function makeSimpleStore(): SimpleStore {
           contacts.set(update.id, update as Contact);
         }
       }
+      log(`[sync] Contacts update: ${updates.length} contacts`);
     });
 
     ev.on('messages.upsert', ({ messages: msgs }) => {
@@ -127,6 +142,7 @@ function makeSimpleStore(): SimpleStore {
         if (!jid) continue;
         upsertMessages(jid, [msg]);
       }
+      log(`[sync] Messages upsert: ${msgs.length} messages`);
     });
 
     ev.on('messages.update', (updates) => {
@@ -168,8 +184,9 @@ function makeSimpleStore(): SimpleStore {
         messages: Array.from(messages.entries()),
       };
       fs.writeFileSync(STORE_FILE, JSON.stringify(data), 'utf-8');
+      log(`[store] Saved to disk: ${chats.size} chats, ${contacts.size} contacts, ${messages.size} message threads`);
     } catch (err) {
-      process.stderr.write(`[store] Error saving store: ${err}\n`);
+      log(`[store] Error saving store: ${err}`);
     }
   }
 
@@ -191,11 +208,9 @@ function makeSimpleStore(): SimpleStore {
       if (data.messages) {
         for (const [k, v] of data.messages) messages.set(k, v);
       }
-      process.stderr.write(
-        `[store] Loaded store from disk: ${chats.size} chats, ${contacts.size} contacts, ${messages.size} message threads\n`,
-      );
+      log(`[store] Loaded store from disk: ${chats.size} chats, ${contacts.size} contacts, ${messages.size} message threads`);
     } catch (err) {
-      process.stderr.write(`[store] Error loading store: ${err}\n`);
+      log(`[store] Error loading store: ${err}`);
     }
   }
 
@@ -260,15 +275,25 @@ export async function connectToWhatsApp(retryCount = 0): Promise<void> {
     },
     logger,
     version,
+    syncFullHistory: true,
+    browser: Browsers.macOS('Desktop'),
   });
 
   // Bind the store to all socket events so it stays up to date
   store.bind(sock.ev);
 
+  // Debug: log all event names to see what Baileys is actually emitting
+  const originalEmit = sock.ev.emit.bind(sock.ev) as (event: string, ...args: any[]) => boolean;
+  sock.ev.emit = function(event: string, ...args: any[]) {
+    log(`[debug] Event emitted: ${event}`);
+    return originalEmit(event, ...args);
+  } as any;
+
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
+      log('[connection] QR code generated, waiting for scan...');
       process.stderr.write('\n[whatsapp] Scan this QR code with WhatsApp (Linked Devices → Link a Device):\n\n');
       qrcode.generate(qr, { small: true }, (code: string) => {
         // qrcode-terminal outputs to stdout by default, so we write to stderr manually
@@ -280,31 +305,27 @@ export async function connectToWhatsApp(retryCount = 0): Promise<void> {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const loggedOut = statusCode === DisconnectReason.loggedOut;
 
-      process.stderr.write(
-        `[whatsapp] Connection closed. Status: ${statusCode ?? 'unknown'}. Logged out: ${loggedOut}\n`,
-      );
+      log(`[connection] Connection closed. Status: ${statusCode ?? 'unknown'}. Logged out: ${loggedOut}`);
 
       if (loggedOut) {
-        process.stderr.write('[whatsapp] Logged out — delete ~/.whatsapp-mcp/auth_info/ and restart to re-authenticate.\n');
+        log('[connection] Logged out — delete ~/.whatsapp-mcp/auth_info/ and restart to re-authenticate.');
         socket = null;
         return;
       }
 
       if (retryCount >= MAX_RETRIES) {
-        process.stderr.write(`[whatsapp] Max reconnect attempts (${MAX_RETRIES}) reached. Giving up.\n`);
+        log(`[connection] Max reconnect attempts (${MAX_RETRIES}) reached. Giving up.`);
         socket = null;
         return;
       }
 
       const delayMs = BASE_BACKOFF_MS * Math.pow(2, retryCount);
-      process.stderr.write(
-        `[whatsapp] Reconnecting in ${delayMs}ms (attempt ${retryCount + 1}/${MAX_RETRIES})…\n`,
-      );
+      log(`[connection] Reconnecting in ${delayMs}ms (attempt ${retryCount + 1}/${MAX_RETRIES})...`);
 
       await new Promise((resolve) => setTimeout(resolve, delayMs));
       await connectToWhatsApp(retryCount + 1);
     } else if (connection === 'open') {
-      process.stderr.write('[whatsapp] Connected to WhatsApp\n');
+      log('[connection] Connected to WhatsApp');
       socket = sock;
       // Reset retry counter on successful connection by not carrying retryCount
     }

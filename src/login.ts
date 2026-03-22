@@ -8,6 +8,14 @@ import makeWASocket, {
 import { Boom } from '@hapi/boom';
 import qrcode from 'qrcode-terminal';
 import pino from 'pino';
+import * as path from 'path';
+import * as fs from 'fs';
+
+const DATA_DIR = path.join(process.env.HOME ?? process.env.USERPROFILE ?? '.', '.whatsapp-mcp');
+const AUTH_DIR = path.join(DATA_DIR, 'auth_info');
+
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 
 const logger = pino({ level: 'info', transport: { target: 'pino-pretty' } });
 
@@ -17,7 +25,7 @@ const MAX_RETRIES = 5;
 async function login() {
   console.log('WhatsApp MCP — Login\n');
 
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version, isLatest } = await fetchLatestBaileysVersion();
   console.log(`Using Baileys v${version.join('.')}, latest: ${isLatest}\n`);
 
@@ -47,7 +55,7 @@ async function login() {
       console.error(`Connection closed. Status: ${statusCode}, Error: ${error?.message ?? 'unknown'}`);
 
       if (statusCode === DisconnectReason.loggedOut) {
-        console.error('Logged out. Delete auth_info/ directory and try again.');
+        console.error(`Logged out. Delete ${AUTH_DIR} directory and try again.`);
         process.exit(1);
       }
 
@@ -63,7 +71,7 @@ async function login() {
     } else if (connection === 'open') {
       retryCount = 0;
       console.log('\n✓ Successfully connected to WhatsApp!');
-      console.log('Auth credentials saved to auth_info/');
+      console.log(`Auth credentials saved to ${AUTH_DIR}`);
       console.log('You can now use the MCP server.\n');
       setTimeout(() => process.exit(0), 2000);
     }

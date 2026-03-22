@@ -12,6 +12,15 @@ import makeWASocket, {
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
 import qrcode from 'qrcode-terminal';
+import * as path from 'path';
+import * as fs from 'fs';
+
+export const DATA_DIR = path.join(process.env.HOME ?? process.env.USERPROFILE ?? '.', '.whatsapp-mcp');
+const AUTH_DIR = path.join(DATA_DIR, 'auth_info');
+const STORE_FILE = path.join(DATA_DIR, 'store_data.json');
+
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 
 // Logger MUST write to stderr (fd 2) — stdout is reserved for MCP JSON-RPC
 const logger = pino({ level: 'warn' }, pino.destination(2));
@@ -27,6 +36,10 @@ export interface SimpleStore {
   messages: Map<string, WAMessage[]>;
   /** Bind the store to a socket's event emitter. */
   bind(ev: BaileysEventEmitter): void;
+  /** Persist store data to disk. */
+  saveToFile(): void;
+  /** Load store data from disk. */
+  loadFromFile(): void;
 }
 
 function makeSimpleStore(): SimpleStore {
@@ -147,11 +160,64 @@ function makeSimpleStore(): SimpleStore {
     });
   }
 
-  return { chats, contacts, messages, bind };
+  function saveToFile(): void {
+    try {
+      const data = {
+        chats: Array.from(chats.entries()),
+        contacts: Array.from(contacts.entries()),
+        messages: Array.from(messages.entries()),
+      };
+      fs.writeFileSync(STORE_FILE, JSON.stringify(data), 'utf-8');
+    } catch (err) {
+      process.stderr.write(`[store] Error saving store: ${err}\n`);
+    }
+  }
+
+  function loadFromFile(): void {
+    try {
+      if (!fs.existsSync(STORE_FILE)) return;
+      const raw = fs.readFileSync(STORE_FILE, 'utf-8');
+      const data = JSON.parse(raw) as {
+        chats?: [string, Chat][];
+        contacts?: [string, Contact][];
+        messages?: [string, WAMessage[]][];
+      };
+      if (data.chats) {
+        for (const [k, v] of data.chats) chats.set(k, v);
+      }
+      if (data.contacts) {
+        for (const [k, v] of data.contacts) contacts.set(k, v);
+      }
+      if (data.messages) {
+        for (const [k, v] of data.messages) messages.set(k, v);
+      }
+      process.stderr.write(
+        `[store] Loaded store from disk: ${chats.size} chats, ${contacts.size} contacts, ${messages.size} message threads\n`,
+      );
+    } catch (err) {
+      process.stderr.write(`[store] Error loading store: ${err}\n`);
+    }
+  }
+
+  return { chats, contacts, messages, bind, saveToFile, loadFromFile };
 }
 
 // Global store instance shared with store.ts helpers
 const store = makeSimpleStore();
+store.loadFromFile();
+
+setInterval(() => {
+  store.saveToFile();
+}, 30_000);
+
+process.on('SIGINT', () => {
+  store.saveToFile();
+  process.exit(0);
+});
+process.on('SIGTERM', () => {
+  store.saveToFile();
+  process.exit(0);
+});
 
 let socket: WASocket | null = null;
 
@@ -184,7 +250,7 @@ export function getStore(): SimpleStore {
  * @param retryCount - Internal retry counter used for exponential backoff.
  */
 export async function connectToWhatsApp(retryCount = 0): Promise<void> {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
@@ -219,7 +285,7 @@ export async function connectToWhatsApp(retryCount = 0): Promise<void> {
       );
 
       if (loggedOut) {
-        process.stderr.write('[whatsapp] Logged out — delete auth_info/ and restart to re-authenticate.\n');
+        process.stderr.write('[whatsapp] Logged out — delete ~/.whatsapp-mcp/auth_info/ and restart to re-authenticate.\n');
         socket = null;
         return;
       }

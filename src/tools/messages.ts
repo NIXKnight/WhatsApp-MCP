@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { AnyMessageContent } from "@whiskeysockets/baileys";
 import { getSocket } from "../whatsapp.js";
-import { getMessages } from "../store.js";
+import { getMessages, getChats, getContacts } from "../store.js";
 
 /**
  * Normalise a phone number string into a WhatsApp JID.
@@ -235,6 +235,233 @@ export function registerMessageTools(server: McpServer): void {
       } catch (err) {
         const message =
           err instanceof Error ? err.message : String(err);
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${message}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -----------------------------------------------------------------------
+  // get_unread_chats
+  // -----------------------------------------------------------------------
+  server.tool(
+    "get_unread_chats",
+    "Returns all chats with unread messages. For each unread chat, returns the " +
+      "chat JID, name (if available), unread count, and the latest unread messages. " +
+      "Use this to check what new messages have arrived across all conversations.",
+    {
+      messageLimit: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Max messages to return per unread chat (default 5)"),
+    },
+    async ({ messageLimit }) => {
+      try {
+        const chats = getChats();
+        const contacts = getContacts();
+        const limit = messageLimit ?? 5;
+
+        const contactMap = new Map<string, string>();
+        for (const c of contacts) {
+          const name = c.name || c.notify || "";
+          if (name) contactMap.set(c.id, name);
+        }
+
+        const unreadChats = chats.filter(
+          (c) => c.unreadCount && c.unreadCount > 0
+        );
+
+        if (unreadChats.length === 0) {
+          return {
+            content: [{ type: "text" as const, text: "No unread chats." }],
+          };
+        }
+
+        const result = unreadChats.map((chat) => {
+          const jid = chat.id ?? "";
+          const isGroup = typeof jid === "string" && jid.endsWith("@g.us");
+          const chatName =
+            chat.name ||
+            (chat as Record<string, unknown>).conversationTitle ||
+            contactMap.get(jid) ||
+            jid;
+
+          const messages = getMessages(jid, limit);
+          const messageSummary = messages
+            .filter((m) => !m.key.fromMe && m.message)
+            .filter(
+              (m) =>
+                !m.message?.protocolMessage && !m.message?.reactionMessage
+            )
+            .map((m) => {
+              const msg = m.message;
+              let text = "";
+              if (msg?.conversation) text = msg.conversation;
+              else if (msg?.extendedTextMessage?.text)
+                text = msg.extendedTextMessage.text;
+              else if (msg?.imageMessage) text = "[Image]" + (msg.imageMessage.caption ? " " + msg.imageMessage.caption : "");
+              else if (msg?.videoMessage) text = "[Video]" + (msg.videoMessage.caption ? " " + msg.videoMessage.caption : "");
+              else if (msg?.audioMessage) text = "[Audio]";
+              else if (msg?.documentMessage) text = "[Document]" + (msg.documentMessage.fileName ? " " + msg.documentMessage.fileName : "");
+              else if (msg?.stickerMessage) text = "[Sticker]";
+              else text = "[Media]";
+
+              return {
+                id: m.key.id,
+                participant: m.key.participant || "",
+                pushName: m.pushName ?? "",
+                text,
+                timestamp: Number(m.messageTimestamp),
+              };
+            });
+
+          return {
+            jid,
+            name: chatName,
+            isGroup,
+            unreadCount: chat.unreadCount,
+            messages: messageSummary,
+          };
+        });
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                { unreadChats: result.length, chats: result },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${message}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // -----------------------------------------------------------------------
+  // get_unread_messages
+  // -----------------------------------------------------------------------
+  server.tool(
+    "get_unread_messages",
+    "Returns a flat list of all unread messages across all chats, sorted by " +
+      "timestamp (newest first). Each message includes the chat JID, chat name, " +
+      "sender name, text, and timestamp. Use this for a quick overview of " +
+      "everything unread.",
+    {},
+    async () => {
+      try {
+        const chats = getChats();
+        const contacts = getContacts();
+
+        const contactMap = new Map<string, string>();
+        for (const c of contacts) {
+          const name = c.name || c.notify || "";
+          if (name) contactMap.set(c.id, name);
+        }
+
+        const unreadChats = chats.filter(
+          (c) => c.unreadCount && c.unreadCount > 0
+        );
+
+        if (unreadChats.length === 0) {
+          return {
+            content: [{ type: "text" as const, text: "No unread messages." }],
+          };
+        }
+
+        const allUnread: Array<{
+          chatJid: string;
+          chatName: string;
+          isGroup: boolean;
+          messageId: string;
+          participant: string;
+          senderName: string;
+          text: string;
+          timestamp: number;
+        }> = [];
+
+        for (const chat of unreadChats) {
+          const jid = chat.id ?? "";
+          const isGroup = typeof jid === "string" && jid.endsWith("@g.us");
+          const chatName =
+            chat.name ||
+            (chat as Record<string, unknown>).conversationTitle ||
+            contactMap.get(jid) ||
+            jid;
+
+          const count = chat.unreadCount ?? 5;
+          const messages = getMessages(jid, Math.min(count, 20));
+
+          for (const m of messages) {
+            if (m.key.fromMe) continue;
+            if (!m.message) continue;
+            if (m.message.protocolMessage || m.message.reactionMessage) continue;
+
+            const msg = m.message;
+            let text = "";
+            if (msg.conversation) text = msg.conversation;
+            else if (msg.extendedTextMessage?.text) text = msg.extendedTextMessage.text;
+            else if (msg.imageMessage) text = "[Image]" + (msg.imageMessage.caption ? " " + msg.imageMessage.caption : "");
+            else if (msg.videoMessage) text = "[Video]" + (msg.videoMessage.caption ? " " + msg.videoMessage.caption : "");
+            else if (msg.audioMessage) text = "[Audio]";
+            else if (msg.documentMessage) text = "[Document]" + (msg.documentMessage.fileName ? " " + msg.documentMessage.fileName : "");
+            else if (msg.stickerMessage) text = "[Sticker]";
+            else text = "[Media]";
+
+            const participant = m.key.participant || m.key.remoteJid || "";
+            const senderName = m.pushName || contactMap.get(participant) || participant;
+
+            allUnread.push({
+              chatJid: jid,
+              chatName: String(chatName),
+              isGroup,
+              messageId: m.key.id || "",
+              participant,
+              senderName,
+              text,
+              timestamp: Number(m.messageTimestamp),
+            });
+          }
+        }
+
+        allUnread.sort((a, b) => b.timestamp - a.timestamp);
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                { totalUnread: allUnread.length, messages: allUnread },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
         return {
           content: [
             {

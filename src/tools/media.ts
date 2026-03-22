@@ -76,7 +76,7 @@ export function registerMediaTools(server: McpServer): void {
       "(e.g. 923001234567) or a full JID (e.g. 120363039783372408@g.us for groups). " +
       "`filePath` is the absolute or relative path to " +
       "the file on disk. `mediaType` is auto-detected from the file extension " +
-      "if omitted.",
+      "if omitted. Set `ptt` to true to send audio as a WhatsApp voice note (requires OGG Opus format).",
     {
       to: z
         .string()
@@ -98,8 +98,15 @@ export function registerMediaTools(server: McpServer): void {
         .describe(
           "Media type override. Auto-detected from extension when omitted."
         ),
+      ptt: z
+        .boolean()
+        .optional()
+        .describe(
+          "Set to true to send audio as a voice note (push-to-talk). " +
+          "File must be OGG Opus format. Ignored for non-audio media types."
+        ),
     },
-    async ({ to, filePath, caption, mediaType }) => {
+    async ({ to, filePath, caption, mediaType, ptt }) => {
       let sock;
       try {
         sock = getSocket();
@@ -138,10 +145,18 @@ export function registerMediaTools(server: McpServer): void {
             });
             break;
           case "audio":
-            await sock.sendMessage(jid, {
-              audio: fileUrl,
-              mimetype: "audio/mp4",
-            });
+            if (ptt) {
+              await sock.sendMessage(jid, {
+                audio: fileUrl,
+                mimetype: "audio/ogg; codecs=opus",
+                ptt: true,
+              });
+            } else {
+              await sock.sendMessage(jid, {
+                audio: fileUrl,
+                mimetype: "audio/mp4",
+              });
+            }
             break;
           case "document": {
             const fileName = path.basename(filePath);

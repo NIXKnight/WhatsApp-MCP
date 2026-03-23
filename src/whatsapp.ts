@@ -176,6 +176,8 @@ function makeSimpleStore(): SimpleStore {
     });
   }
 
+  let lastSavedSummary = '';
+
   function saveToFile(): void {
     try {
       const data = {
@@ -184,7 +186,11 @@ function makeSimpleStore(): SimpleStore {
         messages: Array.from(messages.entries()),
       };
       fs.writeFileSync(STORE_FILE, JSON.stringify(data), 'utf-8');
-      log(`[store] Saved to disk: ${chats.size} chats, ${contacts.size} contacts, ${messages.size} message threads`);
+      const summary = `${chats.size} chats, ${contacts.size} contacts, ${messages.size} threads`;
+      if (summary !== lastSavedSummary) {
+        log(`[store] Saved: ${summary}`);
+        lastSavedSummary = summary;
+      }
     } catch (err) {
       log(`[store] Error saving store: ${err}`);
     }
@@ -235,9 +241,13 @@ process.on('SIGTERM', () => {
 });
 
 let socket: WASocket | null = null;
+let isReconnecting = false;
 
-const MAX_RETRIES = 5;
 const BASE_BACKOFF_MS = 1000;
+const MAX_BACKOFF_MS = 60_000;
+
+let cachedVersion: [number, number, number] | null = null;
+let cachedAuthState: Awaited<ReturnType<typeof useMultiFileAuthState>> | null = null;
 
 /**
  * Returns the active WASocket instance.
@@ -265,8 +275,20 @@ export function getStore(): SimpleStore {
  * @param retryCount - Internal retry counter used for exponential backoff.
  */
 export async function connectToWhatsApp(retryCount = 0): Promise<void> {
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  const { version } = await fetchLatestBaileysVersion();
+  if (isReconnecting) {
+    log('[connection] Reconnect already in progress. Skipping.');
+    return;
+  }
+  isReconnecting = true;
+
+  if (!cachedAuthState) {
+    cachedAuthState = await useMultiFileAuthState(AUTH_DIR);
+  }
+  if (!cachedVersion) {
+    const { version } = await fetchLatestBaileysVersion();
+    cachedVersion = version;
+  }
+  const { state, saveCreds } = cachedAuthState;
 
   const sock = makeWASocket({
     auth: {
@@ -274,20 +296,14 @@ export async function connectToWhatsApp(retryCount = 0): Promise<void> {
       keys: makeCacheableSignalKeyStore(state.keys, logger),
     },
     logger,
-    version,
+    version: cachedVersion,
     syncFullHistory: true,
     browser: Browsers.macOS('Desktop'),
+    keepAliveIntervalMs: 30_000,
   });
 
   // Bind the store to all socket events so it stays up to date
   store.bind(sock.ev);
-
-  // Debug: log all event names to see what Baileys is actually emitting
-  const originalEmit = sock.ev.emit.bind(sock.ev) as (event: string, ...args: any[]) => boolean;
-  sock.ev.emit = function(event: string, ...args: any[]) {
-    log(`[debug] Event emitted: ${event}`);
-    return originalEmit(event, ...args);
-  } as any;
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -302,32 +318,35 @@ export async function connectToWhatsApp(retryCount = 0): Promise<void> {
     }
 
     if (connection === 'close') {
+      isReconnecting = false;
+      socket = null;
+
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-      const loggedOut = statusCode === DisconnectReason.loggedOut;
+      log(`[connection] Closed. Status: ${statusCode ?? 'unknown'}.`);
 
-      log(`[connection] Connection closed. Status: ${statusCode ?? 'unknown'}. Logged out: ${loggedOut}`);
-
-      if (loggedOut) {
-        log('[connection] Logged out — delete ~/.whatsapp-mcp/auth_info/ and restart to re-authenticate.');
-        socket = null;
+      // Permanent disconnections — do not reconnect
+      if (statusCode === DisconnectReason.loggedOut || statusCode === DisconnectReason.forbidden) {
+        log('[connection] Permanent disconnection. Re-authentication required.');
         return;
       }
 
-      if (retryCount >= MAX_RETRIES) {
-        log(`[connection] Max reconnect attempts (${MAX_RETRIES}) reached. Giving up.`);
-        socket = null;
+      // Session replaced (440) or restart required (515) — immediate fresh reconnect, no backoff
+      if (statusCode === DisconnectReason.connectionReplaced || statusCode === DisconnectReason.restartRequired) {
+        log('[connection] Reconnecting immediately (fresh).');
+        await connectToWhatsApp(0);
         return;
       }
 
-      const delayMs = BASE_BACKOFF_MS * Math.pow(2, retryCount);
-      log(`[connection] Reconnecting in ${delayMs}ms (attempt ${retryCount + 1}/${MAX_RETRIES})...`);
-
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
-      await connectToWhatsApp(retryCount + 1);
+      // All other codes — exponential backoff
+      const delayMs = Math.min(BASE_BACKOFF_MS * Math.pow(2, retryCount), MAX_BACKOFF_MS);
+      log(`[connection] Reconnecting in ${delayMs}ms (attempt ${retryCount + 1}).`);
+      await new Promise(r => setTimeout(r, delayMs));
+      const nextRetry = delayMs >= MAX_BACKOFF_MS ? 0 : retryCount + 1;
+      await connectToWhatsApp(nextRetry);
     } else if (connection === 'open') {
+      isReconnecting = false;
       log('[connection] Connected to WhatsApp');
       socket = sock;
-      // Reset retry counter on successful connection by not carrying retryCount
     }
   });
 
